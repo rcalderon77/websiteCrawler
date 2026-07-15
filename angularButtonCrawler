@@ -1,0 +1,179 @@
+import pandas as pd
+import re
+import os
+import hashlib
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright, TimeoutError
+
+# --- CONFIGURATION ---
+EXCEL_FILE = "strings_to_find.xlsx"
+START_URL = "https://example.com"
+MAX_DEPTH = 4  # How deep into nested buttons/menus to go (to prevent infinite loops)
+
+# Safety list - script will skip clicking these
+BLACKLIST_BUTTONS = ["logout", "sign out", "log out", "delete", "remove", "submit", "pay", "cancel", "clear"]
+
+ENCODING_MAP = {
+    "{tm}": "™",
+    "{c}": "©",
+    "{r}": "®",
+    "&amp;": "&",
+}
+
+def normalize_text(text):
+    if not isinstance(text, str):
+        return str(text)
+    for key, value in ENCODING_MAP.items():
+        text = re.sub(re.escape(key), value, text, flags=re.IGNORECASE)
+    return " ".join(text.split())
+
+def is_safe_to_click(text_content):
+    if not text_content:
+        return True
+    text_lower = text_content.lower().strip()
+    return not any(bad_word in text_lower for bad_word in BLACKLIST_BUTTONS)
+
+def get_element_signature(el):
+    """Generates a unique signature for an element based on its properties so we don't click the exact same physical button twice."""
+    try:
+        tag = el.evaluate("el => el.tagName")
+        text = el.inner_text().strip()[:30]
+        classes = el.evaluate("el => el.className")
+        raw_sig = f"{tag}_{text}_{classes}"
+        return hashlib.md5(raw_sig.encode('utf-8')).hexdigest()
+    except Exception:
+        return None
+
+def search_for_targets(page, targets):
+    """Scans the current screen state for your target texts."""
+    unfound = [t for t in targets if not t['found']]
+    for target in unfound:
+        element = page.get_by_text(target['search_text'], exact=False).first
+        if element.count() > 0 and element.is_visible():
+            print(f"  ✅ FOUND Target [{target['id']}]: '{target['search_text']}'")
+            try:
+                element.scroll_into_view_if_needed()
+                element.evaluate("el => el.style.border = '4px solid red'")
+                
+                safe_label = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(target['label']))
+                filename = f"screenshots/{target['id']}_{safe_label}.png"
+                
+                page.screenshot(path=filename, full_page=True)
+                target['found'] = True
+            except Exception as e:
+                print(f"  -> Error screenshotting [{target['id']}]: {e}")
+
+def get_interactable_elements(page):
+    """Dynamically finds all buttons, tabs, labels, and clickable elements."""
+    
+    # We combine all the different ways a developer might build a button into one massive selector
+    selector = (
+        "button, "                                            # Standard HTML buttons
+        "a, "                                                 # Standard links
+        "[role='button'], [role='tab'], [role='menuitem'], "  # ARIA roles (crucial for custom SPA elements)
+        ".mat-mdc-button-base, "                              # Modern Angular Material buttons (v15+)
+        ".mat-button, .mat-raised-button, .mat-icon-button, " # Legacy Angular Material buttons
+        ".btn, "                                              # Bootstrap and standard utility classes
+        "label, "                                             # Labels (often used for custom checkboxes/toggles)
+        "input[type='button'], input[type='submit']"          # Form input buttons
+    )
+    
+    elements = page.locator(selector)
+    visible_elements = []
+    
+    for i in range(elements.count()):
+        el = elements.nth(i)
+        try:
+            if el.is_visible() and el.is_enabled():
+                visible_elements.append(el)
+        except Exception:
+            continue
+    return visible_elements
+
+def main():
+    if not os.path.exists("screenshots"):
+        os.makedirs("screenshots")
+
+    df = pd.read_excel(EXCEL_FILE)
+    targets = [{'id': row['ID'], 'label': row['Label'], 'search_text': normalize_text(row['English Text']), 'found': False} for _, row in df.iterrows()]
+
+    # Track states we've already explored to prevent infinite loops
+    # A state is defined by the chain of element signatures we clicked to get there.
+    explored_paths = set()
+
+    with sync_playwright() as p:
+        print("Launching browser...")
+        browser = p.chromium.launch(headless=False)  # Set to True if you don't want to watch
+        context = browser.new_context(viewport={'width': 1920, 'height': 1080})
+        page = context.new_page()
+
+        def explore_state(current_path, depth):
+            """Recursive DFS function to explore nested menus and button combinations."""
+            # 1. Base cases: Stop if we found everything or hit max depth
+            if not any(not t['found'] for t in targets):
+                return
+            if depth > MAX_DEPTH:
+                return
+
+            # 2. Reset / Navigate to baseline for this path branch
+            try:
+                page.goto(START_URL, wait_until="networkidle", timeout=15000)
+            except Exception:
+                return
+
+            # Recreate the click path to get back to our current deep state
+            for step_sig in current_path:
+                elements = get_interactable_elements(page)
+                clicked_step = False
+                for el in elements:
+                    if get_element_signature(el) == step_sig:
+                        try:
+                            el.click(force=True, timeout=2000)
+                            page.wait_for_timeout(800)
+                            clicked_step = True
+                            break
+                        except Exception:
+                            pass
+                if not clicked_step:
+                    # If we failed to recreate the path, we can't go deeper on this branch
+                    return
+
+            # 3. We are now at our active state. Scan it for targets!
+            search_for_targets(page, targets)
+
+            # 4. Find all interactive items in this state
+            elements = get_interactable_elements(page)
+            signatures_in_state = []
+            
+            for el in elements:
+                sig = get_element_signature(el)
+                if sig and is_safe_to_click(el.inner_text()):
+                    signatures_in_state.append(sig)
+
+            # 5. Try clicking each discovered element to explore deeper combinations
+            for sig in signatures_in_state:
+                new_path = current_path + (sig,)
+                if new_path in explored_paths:
+                    continue  # Already fully explored this branch
+
+                explored_paths.add(new_path)
+                
+                print(f"👉 Deep exploring path (Depth {depth}): {' -> '.join([s[:6] for s in new_path])}")
+                
+                # Recurse deeper
+                explore_state(new_path, depth + 1)
+
+        # Start the recursive deep search
+        explore_state(tuple(), 1)
+        
+        browser.close()
+        
+        print("\n--- DEEP CRAWL COMPLETE ---")
+        missed = [t for t in targets if not t['found']]
+        if missed:
+            print(f"Could not find {len(missed)} items:")
+            for m in missed:
+                print(f"  - [{m['id']}] {m['search_text']}")
+
+if __name__ == "__main__":
+    main()
